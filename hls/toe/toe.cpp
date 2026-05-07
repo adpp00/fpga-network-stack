@@ -119,7 +119,7 @@ void timerWrapper(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitT
 						timer2stateTable_releaseState);
 }
 
-//TODO use same code as in TX Engine
+#if !(RX_DDR_BYPASS)
 void rxAppMemAccessBreakdown(stream<mmCmd> &inputMemAccess, stream<mmCmd> &outputMemAccess, stream<ap_uint<1> > &rxAppDoubleAccess) {
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
@@ -130,30 +130,27 @@ void rxAppMemAccessBreakdown(stream<mmCmd> &inputMemAccess, stream<mmCmd> &outpu
 
 	if (rxAppBreakdown == false) {
 		if (!inputMemAccess.empty())
- 		{
+		{
 			rxAppTempCmd = inputMemAccess.read();
-			if ((rxAppTempCmd.saddr.range(15, 0) + rxAppTempCmd.bbt) > 65536) {
-				rxAppAccLength = 65536 - rxAppTempCmd.saddr;
+			if ((rxAppTempCmd.saddr(WINDOW_BITS-1, 0) + rxAppTempCmd.bbt) > BUFFER_SIZE) {
+				rxAppAccLength = BUFFER_SIZE - rxAppTempCmd.saddr(WINDOW_BITS-1, 0);
 				outputMemAccess.write(mmCmd(rxAppTempCmd.saddr, rxAppAccLength));
 				rxAppBreakdown = true;
 			}
 			else
 				outputMemAccess.write(rxAppTempCmd);
-			//std::cerr << "Mem.Cmd: " << std::hex << rxAppTempCmd.saddr << " - " << rxAppTempCmd.bbt << std::endl;
 			rxAppDoubleAccess.write(rxAppBreakdown);
 		}
 	}
-	else if (rxAppBreakdown == true) {
-		rxAppTempCmd.saddr.range(15, 0) = 0;
+	else {
+		rxAppTempCmd.saddr(WINDOW_BITS-1, 0) = 0;
 		rxAppAccLength = rxAppTempCmd.bbt - rxAppAccLength;
 		outputMemAccess.write(mmCmd(rxAppTempCmd.saddr, rxAppAccLength));
-		//std::cerr << "Mem.Cmd: " << std::hex << rxAppTempCmd.saddr << " - " << rxAppTempCmd.bbt - (65536 - rxAppTempCmd.saddr) << std::endl;
 		rxAppBreakdown = false;
 	}
 }
 
-#if !(RX_DDR_BYPASS)
-template <int WIDTH> 
+template <int WIDTH>
 void rxAppMemDataRead(	stream<net_axis<WIDTH> >&	rxBufferReadData,
 						stream<net_axis<WIDTH> >&	rxDataRsp,
 						stream<ap_uint<1> >&		rxAppDoubleAccess)
@@ -161,7 +158,7 @@ void rxAppMemDataRead(	stream<net_axis<WIDTH> >&	rxBufferReadData,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-	static net_axis<WIDTH> rxAppMemRdRxWord;// = axiWord(0, 0, 0);
+	static net_axis<WIDTH> rxAppMemRdRxWord;
 	static ap_uint<1> rxAppDoubleAccessFlag = 0;
 	static enum rAstate {RXAPP_IDLE = 0, RXAPP_STREAM, RXAPP_JOIN, RXAPP_STREAMMERGED, RXAPP_STREAMUNMERGED, RXAPP_RESIDUE} rxAppState;
 	static ap_uint<8> rxAppMemRdOffset = 0;
@@ -172,146 +169,129 @@ void rxAppMemDataRead(	stream<net_axis<WIDTH> >&	rxBufferReadData,
 	case RXAPP_IDLE:
 		if (!rxAppDoubleAccess.empty() && !rxBufferReadData.empty())
 		{
-			//rxAppMemRdOffset = 0;
 			rxAppDoubleAccessFlag = rxAppDoubleAccess.read();
 			rxBufferReadData.read(rxAppMemRdRxWord);
-			rxAppMemRdOffset = keepToLen(rxAppMemRdRxWord.keep);						// Count the number of valid bytes in this data word
-			if (rxAppMemRdRxWord.last == 1 && rxAppDoubleAccessFlag == 1) {		// If this is the last word and this access was broken down
-				rxAppMemRdRxWord.last = ~rxAppDoubleAccessFlag;					// Negate the last flag inn the axiWord and determine if there's an offset
-				if (rxAppMemRdOffset == (WIDTH/8)) // No need to offset anything
+			rxAppMemRdOffset = keepToLen(rxAppMemRdRxWord.keep);
+			if (rxAppMemRdRxWord.last == 1 && rxAppDoubleAccessFlag == 1) {
+				rxAppMemRdRxWord.last = ~rxAppDoubleAccessFlag;
+				if (rxAppMemRdOffset == (WIDTH/8))
 				{
-					// Output the word directly
 					rxDataRsp.write(rxAppMemRdRxWord);
-					//std::cerr << "Mem.Data: " << std::hex << rxAppMemRdRxWord.data << " - " << rxAppMemRdRxWord.keep << " - " << rxAppMemRdRxWord.last << std::endl;
-					// Jump to stream merged since there's no joining to be performed.
-					rxAppState = RXAPP_STREAMUNMERGED;							
+					rxAppState = RXAPP_STREAMUNMERGED;
 				}
-				else if (rxAppMemRdOffset < (WIDTH/8)) //If this data word is not full
+				else if (rxAppMemRdOffset < (WIDTH/8))
 				{
-					// Don't output anything and go to RXAPP_JOIN to fetch more data to fill in the data word
 					rxAppState = RXAPP_JOIN;
 				}
 			}
-			else if (rxAppMemRdRxWord.last == 1 && rxAppDoubleAccessFlag == 0)	{ // If this is the 1st and last data word of this segment and no mem. access breakdown occured,
-				rxDataRsp.write(rxAppMemRdRxWord);								// then output the data word and stay in this state to read the next segment data
-				//std::cerr << "Mem.Data: " << std::hex << rxAppMemRdRxWord.data << " - " << rxAppMemRdRxWord.keep << " - " << rxAppMemRdRxWord.last << std::endl;
+			else if (rxAppMemRdRxWord.last == 1 && rxAppDoubleAccessFlag == 0) {
+				rxDataRsp.write(rxAppMemRdRxWord);
 			}
-			else {																// Finally if there are more words in this memory access,
-				rxAppState = RXAPP_STREAM;										// then go to RXAPP_STREAM to read them
-				rxDataRsp.write(rxAppMemRdRxWord);								// and output the current word
-				//std::cerr << "Mem.Data: " << std::hex << rxAppMemRdRxWord.data << " - " << rxAppMemRdRxWord.keep << " - " << rxAppMemRdRxWord.last << std::endl;
+			else {
+				rxAppState = RXAPP_STREAM;
+				rxDataRsp.write(rxAppMemRdRxWord);
 			}
-
 		}
 		break;
-	case RXAPP_STREAM:	// This state outputs the all the data words in the 1st memory access of a segment but the 1st one.
+	case RXAPP_STREAM:
 		if (!rxBufferReadData.empty())
 		{
 			rxBufferReadData.read(rxAppMemRdRxWord);
-			rxAppMemRdOffset = keepToLen(rxAppMemRdRxWord.keep);						// Count the number of valid bytes in this data word
-
-			if (rxAppMemRdRxWord.last == 1 && rxAppDoubleAccessFlag == 1) {		// If this is the last word and this access was broken down
-				rxAppMemRdRxWord.last = ~rxAppDoubleAccessFlag;					// Negate the last flag inn the axiWord and determine if there's an offset
-				if (rxAppMemRdOffset == (WIDTH/8)) {									// No need to offset anything
-					rxDataRsp.write(rxAppMemRdRxWord);							// Output the word directly
-					//std::cerr << "Mem.Data: " << std::hex << rxAppMemRdRxWord.data << " - " << rxAppMemRdRxWord.keep << " - " << rxAppMemRdRxWord.last << std::endl;
-					rxAppState = RXAPP_STREAMUNMERGED;							// Jump to stream merged since there's no joining to be performed.
+			rxAppMemRdOffset = keepToLen(rxAppMemRdRxWord.keep);
+			if (rxAppMemRdRxWord.last == 1 && rxAppDoubleAccessFlag == 1) {
+				rxAppMemRdRxWord.last = ~rxAppDoubleAccessFlag;
+				if (rxAppMemRdOffset == (WIDTH/8)) {
+					rxDataRsp.write(rxAppMemRdRxWord);
+					rxAppState = RXAPP_STREAMUNMERGED;
 				}
-				else if (rxAppMemRdOffset < (WIDTH/8)) {								// If this data word is not full
-					rxAppState = RXAPP_JOIN;									// Don't output anything and go to RXAPP_JOIN to fetch more data to fill in the data word
+				else if (rxAppMemRdOffset < (WIDTH/8)) {
+					rxAppState = RXAPP_JOIN;
 				}
 			}
-			else if (rxAppMemRdRxWord.last == 1 && rxAppDoubleAccessFlag == 0) {// If this is the 1st and last data word of this segment and no mem. access breakdown occured,
-				rxDataRsp.write(rxAppMemRdRxWord);								// then output the data word and stay in this state to read the next segment data
-				//std::cerr << "Mem.Data: " << std::hex << rxAppMemRdRxWord.data << " - " << rxAppMemRdRxWord.keep << " - " << rxAppMemRdRxWord.last << std::endl;
-				rxAppState = RXAPP_IDLE;										// and go back to the idle state
+			else if (rxAppMemRdRxWord.last == 1 && rxAppDoubleAccessFlag == 0) {
+				rxDataRsp.write(rxAppMemRdRxWord);
+				rxAppState = RXAPP_IDLE;
 			}
-			else {																// If the segment data hasn't finished yet
-				rxDataRsp.write(rxAppMemRdRxWord);								// output them and stay in this state
-				//std::cerr << "Mem.Data: " << std::hex << rxAppMemRdRxWord.data << " - " << rxAppMemRdRxWord.keep << " - " << rxAppMemRdRxWord.last << std::endl;
+			else {
+				rxDataRsp.write(rxAppMemRdRxWord);
 			}
 		}
 		break;
-	case RXAPP_STREAMUNMERGED:													// This state handles 2nd mem.access data when no realignment is required
+	case RXAPP_STREAMUNMERGED:
 		if (!rxBufferReadData.empty())
 		{
-			net_axis<WIDTH> temp = rxBufferReadData.read();								// If so read the data in a tempVariable
-			if (temp.last == 1)													// If this is the last data word...
-				rxAppState = RXAPP_IDLE;										// Go back to the output state. Everything else is perfectly fine as is
-			rxDataRsp.write(temp);												// Finally, output the data word before changing states
-			std::cerr << "Mem.Data: " << std::hex << temp.data << " - " << temp.keep << " - " << temp.last << std::endl;
+			net_axis<WIDTH> temp = rxBufferReadData.read();
+			if (temp.last == 1)
+				rxAppState = RXAPP_IDLE;
+			rxDataRsp.write(temp);
 		}
 		break;
-	case RXAPP_JOIN:															// This state performs the hand over from the 1st to the 2nd mem. access for this segment if a mem. access has occured
+	case RXAPP_JOIN:
 		if (!rxBufferReadData.empty())
 		{
 			net_axis<WIDTH> temp;
 			temp.data = 0;
 			temp.keep = ~uint64_t(0);
 			temp.last = 0x0;
-
-			temp.data.range((rxAppMemRdOffset * 8) - 1, 0) = rxAppMemRdRxWord.data.range((rxAppMemRdOffset * 8) - 1, 0);	// In any case, insert the data of the new data word in the old one. Here we don't pay attention to the exact number of bytes in the new data word. In case they don't fill the entire remaining gap, there will be garbage in the output but it doesn't matter since the KEEP signal indicates which bytes are valid.
+			temp.data.range((rxAppMemRdOffset * 8) - 1, 0) = rxAppMemRdRxWord.data.range((rxAppMemRdOffset * 8) - 1, 0);
 			rxAppMemRdRxWord = rxBufferReadData.read();
-			temp.data.range(WIDTH-1, (rxAppMemRdOffset * 8)) = rxAppMemRdRxWord.data.range(((8 - rxAppMemRdOffset) * 8) - 1, 0);				// Buffer & realign temp into rxAppmemRdRxWord (which is a static variable)
-			ap_uint<8> tempCounter = keepToLen(rxAppMemRdRxWord.keep);					// Determine how any bytes are valid in the new data word. It might be that this is the only data word of the 2nd segment
-			rxAppOffsetBuffer = tempCounter - ((WIDTH/8) - rxAppMemRdOffset);				// Calculate the number of bytes to go into the next & final data word
+			temp.data.range(WIDTH-1, (rxAppMemRdOffset * 8)) = rxAppMemRdRxWord.data.range(((8 - rxAppMemRdOffset) * 8) - 1, 0);
+			ap_uint<8> tempCounter = keepToLen(rxAppMemRdRxWord.keep);
+			rxAppOffsetBuffer = tempCounter - ((WIDTH/8) - rxAppMemRdOffset);
 			if (rxAppMemRdRxWord.last == 1) {
-				if ((tempCounter + rxAppMemRdOffset) <= (WIDTH/8)) {						// Check if the residue from the 1st segment and the data in the 1st data word of the 2nd segment fill this data word. If not...
-					temp.keep = lenToKeep(tempCounter + rxAppMemRdOffset);	// then set the KEEP value of the output to the sum of the 2 data word's bytes
-					temp.last = 1;									// also set the LAST to 1, since this is going to be the final word of this segment
-					rxAppState = RXAPP_IDLE;									// And go back to idle when finished with this state
+				if ((tempCounter + rxAppMemRdOffset) <= (WIDTH/8)) {
+					temp.keep = lenToKeep(tempCounter + rxAppMemRdOffset);
+					temp.last = 1;
+					rxAppState = RXAPP_IDLE;
 				}
 				else
-					rxAppState = RXAPP_RESIDUE;									// then go to the RXAPP_RESIDUE to output the remaining data words
+					rxAppState = RXAPP_RESIDUE;
 			}
 			else
-				rxAppState = RXAPP_STREAMMERGED;									// then go to the RXAPP_STREAMMERGED to output the remaining data words
-			rxDataRsp.write(temp);												// Finally, write the data word to the output
-			//std::cerr << "Mem.Data: " << std::hex << temp.data << " - " << temp.keep << " - " << temp.last << std::endl;
+				rxAppState = RXAPP_STREAMMERGED;
+			rxDataRsp.write(temp);
 		}
 		break;
-	case RXAPP_STREAMMERGED:													// This state outputs all of the remaining, realigned data words of the 2nd mem.access, which resulted from a data word
+	case RXAPP_STREAMMERGED:
 		if (!rxBufferReadData.empty())
 		{
 			net_axis<WIDTH> temp;
 			temp.data = 0;
 			temp.keep = ~uint64_t(0);
 			temp.last = 0;
-
 			temp.data.range((rxAppMemRdOffset * 8) - 1, 0) = rxAppMemRdRxWord.data.range(WIDTH-1, ((8 - rxAppMemRdOffset) * 8));
-			rxAppMemRdRxWord = rxBufferReadData.read();							// Read the new data word in
+			rxAppMemRdRxWord = rxBufferReadData.read();
 			temp.data.range(WIDTH-1, (rxAppMemRdOffset * 8)) = rxAppMemRdRxWord.data.range(((8 - rxAppMemRdOffset) * 8) - 1, 0);
-			ap_uint<8> tempCounter = keepToLen(rxAppMemRdRxWord.keep);			// Determine how any bytes are valid in the new data word. It might be that this is the only data word of the 2nd segment
-			rxAppOffsetBuffer = tempCounter - ((WIDTH/8) - rxAppMemRdOffset);				// Calculate the number of bytes to go into the next & final data word
+			ap_uint<8> tempCounter = keepToLen(rxAppMemRdRxWord.keep);
+			rxAppOffsetBuffer = tempCounter - ((WIDTH/8) - rxAppMemRdOffset);
 			if (rxAppMemRdRxWord.last == 1) {
-				if ((tempCounter + rxAppMemRdOffset) <= (WIDTH/8)) {							// Check if the residue from the 1st segment and the data in the 1st data word of the 2nd segment fill this data word. If not...
-					temp.keep = lenToKeep(tempCounter + rxAppMemRdOffset);			// then set the KEEP value of the output to the sum of the 2 data word's bytes
-					temp.last = 1;													// also set the LAST to 1, since this is going to be the final word of this segment
-					rxAppState = RXAPP_IDLE;										// And go back to idle when finished with this state
+				if ((tempCounter + rxAppMemRdOffset) <= (WIDTH/8)) {
+					temp.keep = lenToKeep(tempCounter + rxAppMemRdOffset);
+					temp.last = 1;
+					rxAppState = RXAPP_IDLE;
 				}
-				else																// If this not the last word, because it doesn't fit in the available space in this data word
-					rxAppState = RXAPP_RESIDUE;										// then go to the RXAPP_RESIDUE to output the remainder of this data word
+				else
+					rxAppState = RXAPP_RESIDUE;
 			}
-			rxDataRsp.write(temp);												// Finally, write the data word to the output
-			//std::cerr << "Mem.Data: " << std::hex << temp.data << " - " << temp.keep << " - " << temp.last << std::endl;
+			rxDataRsp.write(temp);
 		}
 		break;
 	case RXAPP_RESIDUE:
 		{
-			net_axis<WIDTH> temp;// = axiWord(0, lenToKeep(rxAppOffsetBuffer), 1);
+			net_axis<WIDTH> temp;
 			temp.data = 0;
 			temp.keep = lenToKeep(rxAppOffsetBuffer);
 			temp.last = 1;
-
 			temp.data.range((rxAppMemRdOffset * 8) - 1, 0) = rxAppMemRdRxWord.data.range(WIDTH-1, ((8 - rxAppMemRdOffset) * 8));
-			rxDataRsp.write(temp);												// And finally write the data word to the output
-			//std::cerr << "Mem.Data: " << std::hex << temp.data << " - " << temp.keep << " - " << temp.last << std::endl;
-			rxAppState = RXAPP_IDLE;											// And go back to the idle stage
+			rxDataRsp.write(temp);
+			rxAppState = RXAPP_IDLE;
 		}
 		break;
 	}
 }
-#else
+#endif
+
+#if (RX_DDR_BYPASS)
 template <int WIDTH>
 void rxAppMemDataRead(	stream<ap_uint<1> >&	rxBufferReadCmd,
 						stream<net_axis<WIDTH> >&		rxBufferReadData,
@@ -364,29 +344,25 @@ void rxAppWrapper(	stream<appReadRequest>&			appRxDataReq,
 					stream<bool>&					appListenPortRsp,
 					stream<ap_uint<16> >& 			rxApp2portTable_listen_req,
 					stream<appNotification>&		appNotification,
-					stream<net_axis<WIDTH> > 				&rxBufferReadData,
-					stream<net_axis<WIDTH> > 				&rxDataRsp)
+					stream<net_axis<WIDTH> > 		&rxBufferReadData,
+					stream<net_axis<WIDTH> > 		&rxDataRsp)
 {
 	#pragma HLS INLINE
-	// #pragma HLS PIPELINE II=1
 
 	static stream<mmCmd>			rxAppStreamIf2memAccessBreakdown("rxAppStreamIf2memAccessBreakdown");
 	static stream<ap_uint<1> >		rxAppDoubleAccess("rxAppDoubleAccess");
 	#pragma HLS stream variable=rxAppStreamIf2memAccessBreakdown	depth=16
 	#pragma HLS stream variable=rxAppDoubleAccess					depth=16
 
-#if (RX_DDR_BYPASS)
-	static stream<ap_uint<1> >		rxBufferReadCmd("rxBufferReadCmd");
-	#pragma HLS stream variable=rxBufferReadCmd					depth=4
-#endif
-
-	 // RX Application Stream Interface
 #if !(RX_DDR_BYPASS)
 	rx_app_stream_if(appRxDataReq, rxSar2rxApp_upd_rsp, appRxDataRspMetadata,
 						rxApp2rxSar_upd_req, rxAppStreamIf2memAccessBreakdown);
 	rxAppMemAccessBreakdown(rxAppStreamIf2memAccessBreakdown, rxBufferReadCmd, rxAppDoubleAccess);
 	rxAppMemDataRead<WIDTH>(rxBufferReadData, rxDataRsp, rxAppDoubleAccess);
 #else
+	static stream<ap_uint<1> >		rxBufferReadCmd("rxBufferReadCmd");
+	#pragma HLS stream variable=rxBufferReadCmd					depth=4
+
 	rx_app_stream_if(appRxDataReq, rxSar2rxApp_upd_rsp, appRxDataRspMetadata,
 						rxApp2rxSar_upd_req, rxBufferReadCmd);
 	rxAppMemDataRead(rxBufferReadCmd, rxBufferReadData, rxDataRsp);
@@ -622,7 +598,7 @@ void toe_core(	// Data & Memory Interface
 	static stream<appNotification> 			rxEng2rxApp_notification("rxEng2rxApp_notification");
 	static stream<appNotification>			timer2rxApp_notification("timer2rxApp_notification");
 	static stream<openStatus>				timer2txApp_notification("timer2txApp_notification");
-	#pragma HLS stream variable=rxEng2rxApp_notification		depth=4
+	#pragma HLS stream variable=rxEng2rxApp_notification		depth=64
 	#pragma HLS stream variable=timer2rxApp_notification		depth=4
 	#pragma HLS stream variable=timer2txApp_notification		depth=4
 	#pragma HLS aggregate variable=rxEng2rxApp_notification compact=bit
@@ -890,8 +866,8 @@ void toe(	// Data & Memory Interface
 
 #if !(RX_DDR_BYPASS)
 	#pragma HLS INTERFACE axis register port=rxBufferWriteCmd name=m_axis_rxwrite_cmd
-	#pragma HLS INTERFACE axis register port=rxBufferReadCmd name=m_axis_rxread_cmd
 	#pragma HLS aggregate variable=rxBufferWriteCmd compact=bit
+	#pragma HLS INTERFACE axis register port=rxBufferReadCmd name=m_axis_rxread_cmd
 	#pragma HLS aggregate variable=rxBufferReadCmd compact=bit
 #endif
 	#pragma HLS INTERFACE axis register port=txBufferWriteCmd name=m_axis_txwrite_cmd
@@ -968,13 +944,13 @@ void toe(	// Data & Memory Interface
 	static hls::stream<net_axis<DATA_WIDTH> > rxDataRsp_internal;
 	#pragma HLS STREAM depth=2 variable=rxDataRsp_internal
 
-	convert_axis_to_net_axis<DATA_WIDTH>(ipRxData, 
+	convert_axis_to_net_axis<DATA_WIDTH>(ipRxData,
 							ipRxData_internal);
 
-	convert_axis_to_net_axis<DATA_WIDTH>(rxBufferReadData, 
+	convert_axis_to_net_axis<DATA_WIDTH>(rxBufferReadData,
 							rxBufferReadData_internal);
 
-	convert_axis_to_net_axis<DATA_WIDTH>(txBufferReadData, 
+	convert_axis_to_net_axis<DATA_WIDTH>(txBufferReadData,
 							txBufferReadData_internal);
 
 	convert_net_axis_to_axis<DATA_WIDTH>(ipTxData_internal, 
@@ -986,10 +962,10 @@ void toe(	// Data & Memory Interface
 	convert_net_axis_to_axis<DATA_WIDTH>(txBufferWriteData_internal, 
 							txBufferWriteData);
 
-	convert_axis_to_net_axis<DATA_WIDTH>(txDataReq, 
+	convert_axis_to_net_axis<DATA_WIDTH>(txDataReq,
 							txDataReq_internal);
 
-	convert_net_axis_to_axis<DATA_WIDTH>(rxDataRsp_internal, 
+	convert_net_axis_to_axis<DATA_WIDTH>(rxDataRsp_internal,
 							rxDataRsp);
 				
 	

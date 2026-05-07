@@ -113,8 +113,9 @@ struct stateQuery
 */
 struct rxSarEntry
 {
-	ap_uint<32> recvd; 
+	ap_uint<32> recvd;
 	ap_uint<WINDOW_BITS> appd;
+	ap_uint<32> isn;
 #if (WINDOW_SCALE)
 	ap_uint<4>	win_shift;
 #endif

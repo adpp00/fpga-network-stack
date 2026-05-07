@@ -1109,16 +1109,16 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 #if !(RX_DDR_BYPASS) //if enable DDR, OOO is enabled
 					// Check if packet contains payload
 					// Second part makes sure that app pointer is not overtaken
-					ap_uint<WINDOW_BITS> free_space = ((rxSar.appd - rxSar.head(WINDOW_BITS-1, 0)) - 1);
-					
+					ap_uint<WINDOW_BITS> free_space = ((rxSar.appd - (ap_uint<WINDOW_BITS>)(rxSar.head - rxSar.isn)) - 1);
+
 					if (fsm_meta.meta.length != 0)
 					{
 
-						// Build memory address
+						// Build memory address (0-based: subtract ISN)
 						ap_uint<32> pkgAddr;
 						pkgAddr(31, 30) = 0x0;
 						pkgAddr(29, WINDOW_BITS) = fsm_meta.sessionID(13, 0);
-						pkgAddr(WINDOW_BITS-1, 0) = fsm_meta.meta.seqNumb(WINDOW_BITS-1, 0);
+						pkgAddr(WINDOW_BITS-1, 0) = (fsm_meta.meta.seqNumb - rxSar.isn)(WINDOW_BITS-1, 0);
 
 						ap_uint<32> newRecvd = 0;
 						ap_uint<32> newHead = 0;
@@ -1255,11 +1255,11 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						if ((fsm_meta.meta.seqNumb == rxSar.recvd) && ((rxbuffer_max_data_count - rxbuffer_data_count) > 375))
 						{
 							rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, newHead, rxSar.offset, rxSar.gap));
-							// Build memory address
+							// Build memory address (0-based: subtract ISN)
 							ap_uint<32> pkgAddr;
 							pkgAddr(31, 30) = 0x0;
 							pkgAddr(29, WINDOW_BITS) = fsm_meta.sessionID(13, 0);
-							pkgAddr(WINDOW_BITS-1, 0) = fsm_meta.meta.seqNumb(WINDOW_BITS-1, 0);
+							pkgAddr(WINDOW_BITS-1, 0) = (fsm_meta.meta.seqNumb - rxSar.isn)(WINDOW_BITS-1, 0);
 							// Only notify about new data available
 							rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, fsm_meta.meta.length, fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
 							dropDataFifoOut.write(false);
@@ -1307,7 +1307,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						switch (tcpState)
 						{
 						case SYN_RECEIVED:
-							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, ESTABLISHED, 1)); //TODO MAYBE REARRANGE
+							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, ESTABLISHED, 1));
 							break;
 						case CLOSING:
 							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, TIME_WAIT, 1));
@@ -1488,7 +1488,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						ap_uint<32> pkgAddr;
 						pkgAddr(31, 30) = 0x0;
 						pkgAddr(29, WINDOW_BITS) = fsm_meta.sessionID(13, 0);
-						pkgAddr(WINDOW_BITS-1, 0) = fsm_meta.meta.seqNumb(WINDOW_BITS-1, 0);
+						pkgAddr(WINDOW_BITS-1, 0) = (fsm_meta.meta.seqNumb - rxSar.isn)(WINDOW_BITS-1, 0);
 #if !(RX_DDR_BYPASS)
 						rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
 #endif
@@ -1668,73 +1668,79 @@ void rxPackageDropper(stream<net_axis<WIDTH> >&		dataIn,
 }
 
 /** @ingroup rx_engine
- *  Delays the notifications to the application until the data is actually is written to memory
- *  @param[in]		rxWriteStatusIn, the status which we get back from the DATA MOVER it indicates if the write was successful
- *  @param[in]		internalNotificationFifoIn, incoming notifications
- *  @param[out]		notificationOut, outgoing notifications
- *  @TODO Handle unsuccessful write to memory
+ *  Matches write-status confirmations with buffered notifications and releases them.
+ *  Decoupled from notification output to prevent deadlock: writeStatus is always
+ *  drained regardless of downstream backpressure.
  */
-void rxAppNotificationDelayer(	stream<mmStatus>&				rxWriteStatusIn, stream<appNotification>&		internalNotificationFifoIn,
-								stream<appNotification>&		notificationOut, stream<ap_uint<1> > &doubleAccess) {
+void rxWriteStatusDrain(stream<mmStatus>&			rxWriteStatusIn,
+						stream<appNotification>&	internalNotificationFifoIn,
+						stream<appNotification>&	releasedNotiFifo,
+						stream<ap_uint<1> >&		doubleAccess) {
 #pragma HLS INLINE off
 #pragma HLS pipeline II=1
 
 	static stream<appNotification> rand_notificationBuffer("rand_notificationBuffer");
-	#pragma HLS STREAM variable=rand_notificationBuffer depth=32 //depends on memory delay
+	#pragma HLS STREAM variable=rand_notificationBuffer depth=128
 	#pragma HLS aggregate  variable=rand_notificationBuffer compact=bit
 
-	static ap_uint<1>		rxAppNotificationDoubleAccessFlag = false;
-	static ap_uint<5>		rand_fifoCount = 0;
-	static mmStatus			rxAppNotificationStatus1, rxAppNotificationStatus2;
-	static appNotification	rxAppNotification;
+	static stream<ap_uint<1> > doubleAccessBuffer("rand_doubleAccessBuffer");
+	#pragma HLS STREAM variable=doubleAccessBuffer depth=128
 
-	if (rxAppNotificationDoubleAccessFlag == true) {
-		if(!rxWriteStatusIn.empty()) {
-			rxWriteStatusIn.read(rxAppNotificationStatus2);
+	static ap_uint<1>		dblFlag = false;
+	static ap_uint<8>		rand_fifoCount = 0;
+	static mmStatus			status1, status2;
+	static appNotification	bufferedNoti;
+
+	if (!doubleAccess.empty()) {
+		doubleAccessBuffer.write(doubleAccess.read());
+	}
+
+	if (dblFlag == true) {
+		if (!rxWriteStatusIn.empty()) {
+			rxWriteStatusIn.read(status2);
 			rand_fifoCount--;
-			if (rxAppNotificationStatus1.okay && rxAppNotificationStatus2.okay)
-				if (rxAppNotification.length != 0)
-				{
-					notificationOut.write(rxAppNotification);
-				}
-			rxAppNotificationDoubleAccessFlag = false;
+			if (status1.okay && status2.okay && bufferedNoti.length != 0) {
+				releasedNotiFifo.write(bufferedNoti);
+			}
+			dblFlag = false;
 		}
 	}
-	else if (rxAppNotificationDoubleAccessFlag == false) {
-		if(!rxWriteStatusIn.empty() && !rand_notificationBuffer.empty() && !doubleAccess.empty()) {
-			rxWriteStatusIn.read(rxAppNotificationStatus1);
-			rand_notificationBuffer.read(rxAppNotification);
-			rxAppNotificationDoubleAccessFlag = doubleAccess.read(); 	// Read the double notification flag. If one then go and w8 for the second status
-			if (rxAppNotificationDoubleAccessFlag == 0) {				// if the memory access was not broken down in two for this segment
+	else {
+		if (!rxWriteStatusIn.empty() && !rand_notificationBuffer.empty() && !doubleAccessBuffer.empty()) {
+			rxWriteStatusIn.read(status1);
+			rand_notificationBuffer.read(bufferedNoti);
+			dblFlag = doubleAccessBuffer.read();
+			if (dblFlag == 0) {
 				rand_fifoCount--;
-				if (rxAppNotificationStatus1.okay)
-					if (rxAppNotification.length!=0)
-					{
-						notificationOut.write(rxAppNotification);				// Output the notification
-					}
+				if (status1.okay && bufferedNoti.length != 0) {
+					releasedNotiFifo.write(bufferedNoti);
+				}
 			}
-			//TODO else, we are screwed since the ACK is already sent
 		}
-		else if (!internalNotificationFifoIn.empty() && (rand_fifoCount < 31)) {
-			internalNotificationFifoIn.read(rxAppNotification);
-			//if (rxAppNotification.length != 0) {
-			//	rand_notificationBuffer.write(rxAppNotification);
-			//	rand_fifoCount++;
-			//}
-			//else
-			//	notificationOut.write(rxAppNotification);
-
-			if (rxAppNotification.closed & rxAppNotification.length == 0)
-			{
-				notificationOut.write(rxAppNotification);
+		else if (!internalNotificationFifoIn.empty() && (rand_fifoCount < 127)) {
+			appNotification inNoti = internalNotificationFifoIn.read();
+			if (inNoti.closed & inNoti.length == 0) {
+				releasedNotiFifo.write(inNoti);
 			}
-			else
-			{
-				rand_notificationBuffer.write(rxAppNotification);
+			else {
+				rand_notificationBuffer.write(inNoti);
 				rand_fifoCount++;
 			}
-
 		}
+	}
+}
+
+/** @ingroup rx_engine
+ *  Forwards released notifications to the external output.
+ *  Runs independently: if output stalls, writeStatus drain is unaffected.
+ */
+void rxNotificationForward(stream<appNotification>&	releasedNotiFifo,
+						   stream<appNotification>&	notificationOut) {
+#pragma HLS INLINE off
+#pragma HLS pipeline II=1
+
+	if (!releasedNotiFifo.empty()) {
+		notificationOut.write(releasedNotiFifo.read());
 	}
 }
 
@@ -2003,19 +2009,23 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	#pragma HLS aggregate  variable=rxEng_fsmDropFifo compact=bit
 
 	static stream<appNotification> rx_internalNotificationFifo("rx_internalNotificationFifo");
-	#pragma HLS stream variable=rx_internalNotificationFifo depth=8 //This depends on the memory delay
+	#pragma HLS stream variable=rx_internalNotificationFifo depth=64 //This depends on the memory delay
 	#pragma HLS aggregate  variable=rx_internalNotificationFifo compact=bit
 
 	static stream<mmCmd> 					rxTcpFsm2wrAccessBreakdown("rxTcpFsm2wrAccessBreakdown");
-	#pragma HLS stream variable=rxTcpFsm2wrAccessBreakdown depth=8
+	#pragma HLS stream variable=rxTcpFsm2wrAccessBreakdown depth=64
 	#pragma HLS aggregate  variable=rxTcpFsm2wrAccessBreakdown compact=bit
 
 	static stream<net_axis<WIDTH> > 					rxPkgDrop2rxMemWriter("rxPkgDrop2rxMemWriter");
-	#pragma HLS stream variable=rxPkgDrop2rxMemWriter depth=16
+	#pragma HLS stream variable=rxPkgDrop2rxMemWriter depth=64
 	#pragma HLS aggregate  variable=rxPkgDrop2rxMemWriter compact=bit
 
 	static stream<ap_uint<1> >				rxEngDoubleAccess("rxEngDoubleAccess");
-	#pragma HLS stream variable=rxEngDoubleAccess depth=8
+	#pragma HLS stream variable=rxEngDoubleAccess depth=64
+
+	static stream<appNotification>			releasedNotiFifo("releasedNotiFifo");
+	#pragma HLS stream variable=releasedNotiFifo depth=128
+	#pragma HLS aggregate  variable=releasedNotiFifo compact=bit
 
 
 	//TODO move
@@ -2131,7 +2141,8 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	//rxEngMemWrite(rxPkgDrop2rxMemWriter, rxTcpFsm2wrAccessBreakdown, rxBufferWriteCmd, rxBufferWriteData,rxEngDoubleAccess);
 	rxEngMemWrite<WIDTH>(rxPkgDrop2rxMemWriter, rxTcpFsm2wrAccessBreakdown, rxBufferWriteCmd, rxBufferWriteData,rxEngDoubleAccess);
 
-	rxAppNotificationDelayer(rxBufferWriteStatus, rx_internalNotificationFifo, rxEng2rxApp_notification, rxEngDoubleAccess);
+	rxWriteStatusDrain(rxBufferWriteStatus, rx_internalNotificationFifo, releasedNotiFifo, rxEngDoubleAccess);
+	rxNotificationForward(releasedNotiFifo, rxEng2rxApp_notification);
 #else
 	rxPackageDropper(rxEng_dataBuffer3, rxEng_metaHandlerDropFifo, rxEng_fsmDropFifo, rxBufferWriteData);
 #endif

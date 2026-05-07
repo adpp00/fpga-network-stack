@@ -64,11 +64,10 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 
 		//Pre-calculated usedLength, windowSize to improve timing in metaLoader
 #if (WINDOW_SCALE)
-				ap_uint<WINDOW_BITS> actualWindowSize = (entry.appd - ((ap_uint<WINDOW_BITS>)entry.recvd)) - 1; // This works even for wrap around
+				ap_uint<WINDOW_BITS> actualWindowSize = (entry.appd - ((ap_uint<WINDOW_BITS>)(entry.recvd - entry.isn))) - MSS;
 				reply.windowSize = actualWindowSize >> entry.win_shift;
 #else
-				//This works even for wrap around
-				reply.windowSize = (entry.appd - ((ap_uint<16>)entry.recvd)) - 1; // This works even for wrap around
+				reply.windowSize = (entry.appd - ((ap_uint<16>)(entry.recvd - entry.isn))) - 1;
 #endif
 
 		rxSar2txEng_rsp.write(reply);
@@ -98,7 +97,8 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 			rx_table[in_recvd.sessionID].gap = in_recvd.gap;
 			if (in_recvd.init)
 			{
-				rx_table[in_recvd.sessionID].appd = in_recvd.recvd;
+				rx_table[in_recvd.sessionID].isn = in_recvd.recvd;
+				rx_table[in_recvd.sessionID].appd = 0;
 #if (WINDOW_SCALE)
 				rx_table[in_recvd.sessionID].win_shift = in_recvd.win_shift;
 #endif
